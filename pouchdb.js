@@ -1,5 +1,5 @@
-// This is a forked library from https://github.com/carbureted/react-native-pouchdb
-// Changes: upgraded PouchDB to 5.4.0
+// This is a forked library from: https://github.com/carbureted/react-native-pouchdb
+// It is maintained here: https://github.com/PaulMest/react-native-pouchdb
 
 var base64EncodeChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 var base64DecodeChars = new Array(
@@ -313,7 +313,7 @@ if (!window.atob) window.atob = base64decode;
 
 
 
-// PouchDB 5.4.0
+// PouchDB 5.4.4
 //
 // (c) 2012-2016 Dale Harvey and the PouchDB team
 // PouchDB may be freely distributed under the Apache license, version 2.0.
@@ -623,6 +623,31 @@ function isUndefined(arg) {
 // shim for using process in browser
 
 var process = module.exports = {};
+
+// cached from whatever global is present so that test runners that stub it
+// don't break things.  But we need to wrap it in a try catch in case it is
+// wrapped in strict mode code which doesn't define any globals.  It's inside a
+// function because try/catches deoptimize in certain engines.
+
+var cachedSetTimeout;
+var cachedClearTimeout;
+
+(function () {
+  try {
+    cachedSetTimeout = setTimeout;
+  } catch (e) {
+    cachedSetTimeout = function () {
+      throw new Error('setTimeout is not defined');
+    }
+  }
+  try {
+    cachedClearTimeout = clearTimeout;
+  } catch (e) {
+    cachedClearTimeout = function () {
+      throw new Error('clearTimeout is not defined');
+    }
+  }
+} ())
 var queue = [];
 var draining = false;
 var currentQueue;
@@ -647,7 +672,7 @@ function drainQueue() {
     if (draining) {
         return;
     }
-    var timeout = setTimeout(cleanUpNextTick);
+    var timeout = cachedSetTimeout(cleanUpNextTick);
     draining = true;
 
     var len = queue.length;
@@ -664,7 +689,7 @@ function drainQueue() {
     }
     currentQueue = null;
     draining = false;
-    clearTimeout(timeout);
+    cachedClearTimeout(timeout);
 }
 
 process.nextTick = function (fun) {
@@ -676,7 +701,7 @@ process.nextTick = function (fun) {
     }
     queue.push(new Item(fun, args));
     if (queue.length === 1 && !draining) {
-        setTimeout(drainQueue, 0);
+        cachedSetTimeout(drainQueue, 0);
     }
 };
 
@@ -3674,7 +3699,7 @@ PouchDB.defaults = function (defaultOpts) {
 };
 
 // managed automatically by set-version.js
-var version = "5.4.0";
+var version = "5.4.4";
 
 PouchDB.version = version;
 
@@ -4750,12 +4775,6 @@ function idbBulkDocs(dbOpts, req, opts, api, idb, idbChanges, callback) {
       isUpdate, resultsIdx, callback);
   }
 
-  function autoCompact(docInfo) {
-
-    var revsToDelete = compactTree(docInfo.metadata);
-    compactRevs(revsToDelete, docInfo.metadata.id, txn);
-  }
-
   function finishDoc(docInfo, winningRev, winningRevIsDeleted,
                      isUpdate, resultsIdx, callback) {
 
@@ -4767,10 +4786,14 @@ function idbBulkDocs(dbOpts, req, opts, api, idb, idbChanges, callback) {
     delete doc._rev;
 
     function afterPutDoc(e) {
+      var revsToDelete = docInfo.stemmedRevs || [];
+
       if (isUpdate && api.auto_compaction) {
-        autoCompact(docInfo);
-      } else if (docInfo.stemmedRevs.length) {
-        compactRevs(docInfo.stemmedRevs, docInfo.metadata.id, txn);
+        revsToDelete = revsToDelete.concat(compactTree(docInfo.metadata));
+      }
+
+      if (revsToDelete && revsToDelete.length) {
+        compactRevs(revsToDelete, docInfo.metadata.id, txn);
       }
 
       metadata.seq = e.target.result;
@@ -6508,10 +6531,13 @@ function websqlBulkDocs(dbOpts, req, opts, api, db, websqlChanges, callback) {
 
     function dataWritten(tx, seq) {
       var id = docInfo.metadata.id;
+
+      var revsToCompact = docInfo.stemmedRevs || [];
       if (isUpdate && api.auto_compaction) {
-        compactRevs$1(compactTree(docInfo.metadata), id, tx);
-      } else if (docInfo.stemmedRevs.length) {
-        compactRevs$1(docInfo.stemmedRevs, id, tx);
+        revsToCompact = compactTree(docInfo.metadata).concat(revsToCompact);
+      }
+      if (revsToCompact.length) {
+        compactRevs$1(revsToCompact, id, tx);
       }
 
       docInfo.metadata.seq = seq;
@@ -6720,7 +6746,11 @@ function WebSqlPouch$1(opts, callback) {
 
   // extend the options here, because sqlite plugin has a ton of options
   // and they are constantly changing, so it's more prudent to allow anything
-  var websqlOpts = jsExtend.extend({}, opts, {size: size, version: POUCH_VERSION});
+  var websqlOpts = jsExtend.extend({}, opts, {
+    version: POUCH_VERSION,
+    description: opts.name,
+    size: size
+  });
   var openDBResult = openDB(websqlOpts);
   if (openDBResult.error) {
     return websqlError(callback)(openDBResult.error);
@@ -7688,20 +7718,30 @@ function valid() {
   return isValidWebSQL();
 }
 
-function websql(optsOrName, version, description, size) {
-  if (typeof sqlitePlugin !== 'undefined') {
-    // The SQLite Plugin started deviating pretty heavily from the
-    // standard openDatabase() function, as they started adding more features.
-    // It's better to just use their "new" format and pass in a big ol'
-    // options object.
-    return sqlitePlugin.openDatabase(optsOrName);
-  }
+function createOpenDBFunction(opts) {
+  return function (name, version, description, size) {
+    if (typeof sqlitePlugin !== 'undefined') {
+      // The SQLite Plugin started deviating pretty heavily from the
+      // standard openDatabase() function, as they started adding more features.
+      // It's better to just use their "new" format and pass in a big ol'
+      // options object. Also there are many options here that may come from
+      // the PouchDB constructor, so we have to grab those.
+      var sqlitePluginOpts = jsExtend.extend({}, opts, {
+        name: name,
+        version: version,
+        description: description,
+        size: size
+      });
+      return sqlitePlugin.openDatabase(sqlitePluginOpts);
+    }
 
-  // Traditional WebSQL API
-  return openDatabase(optsOrName, version, description, size);
+    // Traditional WebSQL API
+    return openDatabase(name, version, description, size);
+  };
 }
 
 function WebSQLPouch(opts, callback) {
+  var websql = createOpenDBFunction(opts);
   var _opts = jsExtend.extend({
     websql: websql
   }, opts);
